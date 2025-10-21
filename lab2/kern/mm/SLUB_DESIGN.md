@@ -2,9 +2,9 @@
 
 ## 目标与背景
 - 在页级分配（buddy system）之上提供对象级分配，提升小对象分配效率。
-- 保持与现有 `pmm_manager` 接口风格一致，方便在 `pmm.c` 中切换管理器。
+- **保持与现有 `pmm_manager` 接口风格一致，方便在 `pmm.c` 中切换管理器。**
 - 支持常见对象大小：`32B, 64B, 128B, 256B, 512B, 1024B, 2048B, 4096B`。
-- 以教学为主的简化版本，尽量直观，不做过度工程化。
+- **详情见实验报告第二个challenge部分！！**
 
 ## 两层架构
 - 第一层（页级）：复用 buddy system 的 `alloc_pages/free_pages` 完成页块管理。
@@ -31,12 +31,12 @@
 
 ## 交互边界
 - `slub_pmm_manager.alloc_pages/free_pages/nr_free_pages` 委托给 buddy，保持与其他 pmm 的接口一致。
-- 对象接口：在实现文件中提供 `slub_alloc(size)` / `slub_free(ptr, size)`，用于测试与教学演示。
+- 对象接口：在实现文件中提供 `slub_alloc(size)` / `slub_free(ptr, size)`，用于测试。
 
 ## 简化与取舍
-- 不做 slab 回收（空 slab 保留在 partial 列以便后续复用）。
+- 没有做 slab 回收（空 slab 保留在 partial 列以便后续复用）。
 - 不做对象头记录 cache 索引（释放时由调用者传入 size）；
-  - 若需要严格校验，通常在对象头写入 cache 信息，此处为教学节省复杂度。
+  - 若需要严格校验，通常在对象头写入 cache 信息
 - 每个 slab 仅用一页（Linux SLUB 实际可多页并包含更复杂的 cpu/partial 管理）。
 
 ## 正确性测试要点
@@ -49,7 +49,6 @@
 ## 与 Linux SLUB 的关系
 - 借鉴其“缓存+slab+对象”的核心思想与两个层次的设计。
 - 实现细节简化，不涉及 cpu 本地缓存、partial 对象集、对象校验、红黑树等。
-- 目的在于在 uCore 的教学场景下展示 SLUB 设计主线与接口协同。
 
 ## 使用方式
 - 在 `pmm.c` 中将 `pmm_manager = &slub_pmm_manager;`，其余逻辑保持不变。
