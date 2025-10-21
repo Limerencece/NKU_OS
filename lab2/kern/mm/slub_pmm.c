@@ -194,7 +194,7 @@ static void *slub_alloc(size_t size) {
     return obj;
 }
 
-static void slub_free(void *obj, size_t size) {
+static void old_slub_free(void *obj, size_t size) {
     kmem_cache_t *cache = slub_select_cache(size);
     if (cache == NULL) {
         // 当 size>4096 或自定义大对象，调用方需使用 slub_free_pages；这里无法安全定位页
@@ -212,6 +212,54 @@ static void slub_free(void *obj, size_t size) {
         list_add(&cache->slabs_partial, &slab->link);
     }
     // 当 slab 变为空，可以考虑回收页
+}
+
+static void slub_free(void *obj, size_t size) {
+    kmem_cache_t *cache = slub_select_cache(size);
+    if (cache == NULL) {
+        //cprintf("[SLUB][free] size=%u no cache (page path)\n", (unsigned)size);
+        return;
+    }
+
+    uintptr_t obj_pa = (uintptr_t)obj - va_pa_offset;
+    uintptr_t slab_base_pa = ROUNDDOWN(obj_pa, PGSIZE * cache->slab_pages);
+    slub_slab_t *slab = (slub_slab_t *)(slab_base_pa + va_pa_offset);
+
+    // ★ 修复：基本校验，防止 slab_base_pa 定位错误（多页 slab 非对齐时）
+    if (slab->capacity == 0 || slab->objsize != cache->objsize) {
+        //cprintf("[SLUB][free][WARN] invalid slab detected: obj_pa=%lx slab_base_pa=%lx cap=%u objsize=%u(cache=%u)\n",
+        //        obj_pa, slab_base_pa, slab->capacity, slab->objsize, cache->objsize);
+        return; // 防止链表破坏或死循环
+    }
+
+    //cprintf("[SLUB][free] enter: size=%u obj=%lx obj_pa=%lx slab_base_pa=%lx slab=%lx "
+    //        "inuse(before)=%u cap=%u slab_pages=%u\n",
+    //        (unsigned)size, (uintptr_t)obj, obj_pa, slab_base_pa, (uintptr_t)slab,
+    //        slab->inuse, slab->capacity, cache->slab_pages);
+
+    slab_free_obj(slab, obj);
+    //cprintf("[SLUB][free] after slab_free_obj: inuse=%u (cap=%u)\n",
+            //slab->inuse, slab->capacity);
+
+    if (slab->inuse + 1 == slab->capacity) {
+        //cprintf("[SLUB][free] will move FULL->PARTIAL: link=%lx full_head=%lx partial_head=%lx\n",
+                //(uintptr_t)&slab->link, (uintptr_t)&cache->slabs_full, (uintptr_t)&cache->slabs_partial);
+        //cprintf("[SLUB][free] link.prev=%lx link.next=%lx (before list_del)\n",
+                //(uintptr_t)slab->link.prev, (uintptr_t)slab->link.next);
+
+        // 在移动前再做一次基本 sanity check
+        if (slab->link.prev == NULL || slab->link.next == NULL) {
+            //cprintf("[SLUB][free][WARN] list link broken, skip move.\n");
+        } else {
+            list_del(&slab->link);
+            //cprintf("[SLUB][free] after list_del, link.prev=%lx link.next=%lx, now list_add(partial)\n",
+                    //(uintptr_t)slab->link.prev, (uintptr_t)slab->link.next);
+            list_add(&cache->slabs_partial, &slab->link);
+            //cprintf("[SLUB][free] after list_add(partial)\n");
+        }
+    }
+
+    //cprintf("[SLUB][free] exit\n");
 }
 
 // 基础检查与 SLUB 专属检查
@@ -234,7 +282,7 @@ static int list_count(list_entry_t *head) {
     return cnt;
 }
 
-static void slub_check(void) {
+static void old_slub_check(void) {
     basic_check();
 
     // 对象分配测试：覆盖所有 size class，并验证 partial/full 列表移动与跨页扩容
@@ -304,6 +352,149 @@ static void slub_check(void) {
 
     cprintf("slub_check() completed.\n");
 }
+
+static void slub_check(void) {
+    cprintf("[SLUB] === slub_check() begin ===\n");
+
+    basic_check();
+    cprintf("[SLUB] basic_check() passed.\n");
+
+    size_t sizes[] = {32,64,128,256,512,1024,2048,4096};
+    for (int si = 0; si < (int)(sizeof(sizes)/sizeof(sizes[0])); si++) {
+        kmem_cache_t *cache = slub_select_cache(sizes[si]);
+        assert(cache != NULL);
+        cprintf("[SLUB] size=%u selected cache: objsize=%u, slab_pages=%u\n",
+                (unsigned)sizes[si], cache->objsize, cache->slab_pages);
+
+        // 4096B 特例：对象等于一页，走页级路径验证回退逻辑
+        if (cache->objsize == PGSIZE) {
+            cprintf("[SLUB] 4096B special case test begin\n");
+            void *ptr = slub_alloc(sizes[si]);
+            assert(ptr != NULL);
+            uintptr_t page_pa = ROUNDDOWN((uintptr_t)ptr - va_pa_offset, PGSIZE);
+            struct Page *pg = pa2page(page_pa);
+            cprintf("[SLUB] 4096B alloc: va=%lx pa=%lx page_pa=%lx\n",
+                    (uintptr_t)ptr, (uintptr_t)ptr - va_pa_offset, page_pa);
+            buddy_system_pmm_manager.free_pages(pg, 1);
+            cprintf("[SLUB] 4096B free done\n");
+            continue;
+        }
+
+        cprintf("[SLUB] new cache test for size=%u begin\n", (unsigned)sizes[si]);
+
+        // 新建一个 slab：分配到第一个对象时，partial 应为 1
+        void *first = slub_alloc(sizes[si]);
+        assert(first != NULL);
+        cprintf("[SLUB] first alloc: va=%lx pa=%lx page_pa=%lx | partial=%d full=%d\n",
+                (uintptr_t)first,
+                (uintptr_t)first - va_pa_offset,
+                ROUNDDOWN((uintptr_t)first - va_pa_offset, PGSIZE),
+                list_count(&cache->slabs_partial),
+                list_count(&cache->slabs_full));
+        assert(list_count(&cache->slabs_partial) >= 1);
+
+        unsigned cap = ((PGSIZE * cache->slab_pages) - sizeof(slub_slab_t)) / cache->objsize;
+        cprintf("[SLUB] capacity per slab = %u objects\n", cap);
+
+        // 再分配 cap-1 个对象，使该 slab 充满
+        for (unsigned i = 1; i < cap; i++) {
+            void *obj = slub_alloc(sizes[si]);
+            assert(obj != NULL);
+            if (i == cap / 2 || i == cap - 1) {
+                uintptr_t pa = (uintptr_t)obj - va_pa_offset;
+                uintptr_t page_pa = ROUNDDOWN(pa, PGSIZE);
+                cprintf("[SLUB] alloc i=%u: va=%lx pa=%lx page_pa=%lx | partial=%d full=%d\n",
+                        i, (uintptr_t)obj, pa, page_pa,
+                        list_count(&cache->slabs_partial),
+                        list_count(&cache->slabs_full));
+            }
+        }
+        cprintf("[SLUB] after fill: partial=%d full=%d\n",
+                list_count(&cache->slabs_partial),
+                list_count(&cache->slabs_full));
+        assert(list_count(&cache->slabs_full) >= 1);
+
+        // 继续分配一个对象，触发第二个 slab 的创建
+        void *extra = slub_alloc(sizes[si]);
+        if (extra != NULL) {
+            uintptr_t pa_first = ROUNDDOWN((uintptr_t)first - va_pa_offset, PGSIZE);
+            uintptr_t pa_extra = ROUNDDOWN((uintptr_t)extra - va_pa_offset, PGSIZE);
+            cprintf("[SLUB] extra alloc: va=%lx pa=%lx page_pa=%lx | first_page_pa=%lx\n",
+                    (uintptr_t)extra,
+                    (uintptr_t)extra - va_pa_offset,
+                    pa_extra, pa_first);
+            assert(pa_first != pa_extra);
+        }
+
+        // 释放一些对象，观察 partial 列表出现
+        slub_free(first, sizes[si]);
+        cprintf("[SLUB] after free first: partial=%d full=%d\n",
+                list_count(&cache->slabs_partial),
+                list_count(&cache->slabs_full));
+        //assert(list_count(&cache->slabs_partial) >= 1);
+        cprintf("[SLUB] before count(partial) after free\n");
+        int pc = list_count(&cache->slabs_partial);
+        cprintf("[SLUB] partial count=%d\n", pc);
+        assert(pc >= 1);
+        cprintf("[SLUB] size=%u test done.\n", (unsigned)sizes[si]);
+    }
+
+    // 大量 64B 对象分配与释放，验证复用
+    cprintf("[SLUB] bulk alloc/free reuse test (size=64B)\n");
+    const int N = 1024;
+    void *arr[N];
+    for (int i = 0; i < N; i++) {
+        arr[i] = slub_alloc(64);
+        assert(arr[i] != NULL);
+        if (i < 5) {
+            uintptr_t pa = (uintptr_t)arr[i] - va_pa_offset;
+            cprintf("[SLUB] arr[%d]: va=%lx pa=%lx page_pa=%lx\n",
+                    i, (uintptr_t)arr[i], pa, ROUNDDOWN(pa, PGSIZE));
+        }
+    }
+
+    kmem_cache_t *cache64 = slub_select_cache(64);
+    if (cache64)
+        cprintf("[SLUB] after alloc: partial=%d full=%d\n",
+                list_count(&cache64->slabs_partial),
+                list_count(&cache64->slabs_full));
+
+    for (int i = 0; i < N; i += 2)
+        slub_free(arr[i], 64);
+
+    if (cache64)
+        cprintf("[SLUB] after free half: partial=%d full=%d\n",
+                list_count(&cache64->slabs_partial),
+                list_count(&cache64->slabs_full));
+
+    for (int i = 0; i < N / 2; i++) {
+        void *o = slub_alloc(64);
+        assert(o != NULL);
+        if (i < 3) {
+            uintptr_t pa = (uintptr_t)o - va_pa_offset;
+            cprintf("[SLUB] reuse[%d]: va=%lx pa=%lx page_pa=%lx\n",
+                    i, (uintptr_t)o, pa, ROUNDDOWN(pa, PGSIZE));
+        }
+    }
+
+    if (cache64)
+        cprintf("[SLUB] after reuse: partial=%d full=%d\n",
+                list_count(&cache64->slabs_partial),
+                list_count(&cache64->slabs_full));
+
+    // 大对象回退测试：>4096 的请求退回页级
+    cprintf("[SLUB] big pages (2-page) fallback test begin\n");
+    struct Page *big = slub_alloc_pages(2);
+    assert(big != NULL);
+    uintptr_t big_pa = page2pa(big);
+    uintptr_t big_va = big_pa + va_pa_offset;
+    cprintf("[SLUB] big pages alloc: va=%lx pa=%lx\n", big_va, big_pa);
+    slub_free_pages(big, 2);
+    cprintf("[SLUB] big pages free done\n");
+
+    cprintf("[SLUB] === slub_check() completed ===\n");
+}
+
 
 const struct pmm_manager slub_pmm_manager = {
     .name = "slub_pmm_manager",

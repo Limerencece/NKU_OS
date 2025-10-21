@@ -36,10 +36,10 @@ static void check_alloc_page(void);  // 分配页检查函数声明
 
 // init_pmm_manager - initialize a pmm_manager instance
 static void init_pmm_manager(void) {
-    //pmm_manager = &default_pmm_manager;  // 使用默认内存管理器
-    //pmm_manager = &buddy_system_pmm_manager;  // 使用伙伴系统内存管理器
-    pmm_manager = &slub_pmm_manager;  // 使用SLUB内存管理器
-    //pmm_manager = &best_fit_pmm_manager;      // 也可以使用最佳适应算法
+    //pmm_manager = &default_pmm_manager;
+    //pmm_manager = &buddy_system_pmm_manager;
+    pmm_manager = &slub_pmm_manager;
+    //pmm_manager = &best_fit_pmm_manager; 
     cprintf("memory management: %s\n", pmm_manager->name);  // 打印内存管理器名称
     pmm_manager->init();  // 初始化内存管理器
 }
@@ -67,40 +67,55 @@ size_t nr_free_pages(void) {
 }
 
 static void page_init(void) {
+    // 设定高半区“虚拟地址=物理地址+固定偏移”的转换参数；KADDR/PADDR宏依赖该偏移进行VA<->PA转换
     va_pa_offset = PHYSICAL_MEMORY_OFFSET;  // 设置虚拟地址到物理地址的偏移
 
-    uint64_t mem_begin = get_memory_base();  // 获取内存起始地址
-    uint64_t mem_size  = get_memory_size();   // 获取内存大小
+    // 从DTB（设备树）解析物理内存的起始地址与大小，硬件/引导程序在上电时传入该信息
+    uint64_t mem_begin = get_memory_base();  // 获取内存起始地址（物理）
+    uint64_t mem_size  = get_memory_size();  // 获取内存大小（字节）
+    // 若无法从DTB获取到物理内存信息，系统无法建立物理内存管理，直接终止
     if (mem_size == 0) {
         panic("DTB memory info not available");  // 内存信息不可用
     }
+    // 计算物理内存的结束地址区间上界（半开区间），用于后续页数/边界对齐计算
     uint64_t mem_end   = mem_begin + mem_size;  // 计算内存结束地址
 
+    // 打印一条人类可读的内存映射摘要，便于验证设备树解析结果是否符合预期
     cprintf("physcial memory map:\n");
     cprintf("  memory: 0x%016lx, [0x%016lx, 0x%016lx].\n", mem_size, mem_begin,
-            mem_end - 1);  // 打印物理内存映射信息
+            mem_end - 1);  // 打印物理内存映射信息（显示为闭区间）
 
+    // 暂以设备树给出的结束地址作为可管理物理地址的上界
     uint64_t maxpa = mem_end;  // 最大物理地址
 
+    // 为安全与一致性，限制可管理物理空间不超过内核建立的直映窗口上界 KERNTOP
     if (maxpa > KERNTOP) {
-        maxpa = KERNTOP;  // 限制最大地址不超过内核顶部
+        maxpa = KERNTOP;  // 限制最大地址不超过内核顶部（高半区直映边界）
     }
 
+    // 链接器脚本符号 end 指向内核镜像末尾（代码/数据/BSS后），用于安排Page数组的放置位置
     extern char end[];  // 内核结束地址（来自链接器脚本）
 
+    // 以页为单位统计可管理的物理内存总量：PGSIZE通常为4KiB
     npage = maxpa / PGSIZE;  // 计算总页数
-    //kernel在end[]结束, pages是剩下的页的开始
+    // 将Page描述符数组放在内核镜像之后，并对齐到页边界：每个物理页对应一个Page条目
     pages = (struct Page *)ROUNDUP((void *)end, PGSIZE);  // 页结构数组起始地址（页对齐）
 
+    // 先统一将所有Page条目标记为“保留”，防止误分配；稍后仅对真正空闲的物理区间解除保留
     for (size_t i = 0; i < npage - nbase; i++) {
         SetPageReserved(pages + i);  // 标记所有页为保留状态
     }
 
+    // 计算在内核镜像之后、Page数组占用完成之后的第一个可用物理地址
+    // 步骤：pages(虚拟) + Page数组字节数 => 转换为物理地址PADDR => 得到可分配内存的起点
     uintptr_t freemem = PADDR((uintptr_t)pages + sizeof(struct Page) * (npage - nbase));  // 空闲内存起始地址
 
+    // 将空闲区的起止边界按页对齐：起点向上取整，终点向下取整，确保不会跨页
     mem_begin = ROUNDUP(freemem, PGSIZE);  // 空闲内存起始地址（页对齐）
-    mem_end = ROUNDDOWN(mem_end, PGSIZE);   // 内存结束地址（页对齐）
+    mem_end = ROUNDDOWN(mem_end, PGSIZE);  // 内存结束地址（页对齐）
+    // 若存在非空的可分配区间，则将这段区间交给选定的物理内存管理器建立空闲页结构
     if (freemem < mem_end) {
+        // 将物理地址mem_begin转换为Page指针（区间起点），区间长度换算为页数传入
         init_memmap(pa2page(mem_begin), (mem_end - mem_begin) / PGSIZE);  // 初始化空闲内存映射
     }
 }
