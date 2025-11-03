@@ -1,0 +1,79 @@
+#include <clock.h>
+#include <console.h>
+#include <defs.h>
+#include <intr.h>
+#include <kdebug.h>
+#include <kmonitor.h>
+#include <pmm.h>
+#include <stdio.h>
+#include <string.h>
+#include <trap.h>
+#include <dtb.h>
+
+int kern_init(void) __attribute__((noreturn));
+void grade_backtrace(void);
+
+void test_illegal(void) {
+    cprintf("\n Testing  illegal instruction_32 \n");
+    asm volatile (".word 0xffffffff");     // 非法 32 位编码，低两位 == 0x3
+
+    cprintf("\n Testing  illegal instruction_16 \n");
+    asm volatile (".short 0x0000");        // 非法 16 位半字，低两位 != 0x3
+}
+
+void test_breakpoint(void) {
+    cprintf("\n Testing  breakpoint_32 \n");
+    asm volatile ("ebreak");               // 标准断点      
+
+    cprintf("\n Testing  breakpoint_16 \n");
+    asm volatile (".short 0x9002");        // 压缩断点 c.ebreak
+}
+
+int kern_init(void) {
+    extern char edata[], end[];
+    // 先清零 BSS，再读取并保存 DTB 的内存信息，避免被清零覆盖（为了解释变化 正式上传时我觉得应该删去这句话）
+    memset(edata, 0, end - edata);
+    dtb_init();
+    cons_init();  // init the console
+    const char *message = "(THU.CST) os is loading ...\0";
+    //cprintf("%s\n\n", message);
+    cputs(message);
+
+    print_kerninfo();
+
+    // grade_backtrace();
+    idt_init();  // init interrupt descriptor table
+
+    pmm_init();  // init physical memory management
+
+    idt_init();  // init interrupt descriptor table
+
+    // 异常测试
+    test_illegal();
+    test_breakpoint();
+    
+    // 中断测试
+    clock_init();   // init clock interrupt，就在这触发的时钟中断
+
+    intr_enable();  // enable irq interrupt
+
+    /* do nothing */
+    while (1)
+        ;
+}
+
+void __attribute__((noinline))
+grade_backtrace2(int arg0, int arg1, int arg2, int arg3) {
+    mon_backtrace(0, NULL, NULL);
+}
+
+void __attribute__((noinline)) grade_backtrace1(int arg0, int arg1) {
+    grade_backtrace2(arg0, (uintptr_t)&arg0, arg1, (uintptr_t)&arg1);
+}
+
+void __attribute__((noinline)) grade_backtrace0(int arg0, int arg1, int arg2) {
+    grade_backtrace1(arg0, arg2);
+}
+
+void grade_backtrace(void) { grade_backtrace0(0, (uintptr_t)kern_init, 0xffff0000); }
+
