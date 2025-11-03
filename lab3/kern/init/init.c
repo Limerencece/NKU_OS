@@ -14,19 +14,16 @@ int kern_init(void) __attribute__((noreturn));
 void grade_backtrace(void);
 
 void test_illegal(void) {
-    cprintf("\n Testing  illegal instruction_32 \n");
+    cprintf("\n Testing  illegal instruction1 \n");
     asm volatile (".word 0xffffffff");     // 非法 32 位编码，低两位 == 0x3
 
-    cprintf("\n Testing  illegal instruction_16 \n");
+    cprintf("\n Testing  illegal instruction2 \n");
     asm volatile (".short 0x0000");        // 非法 16 位半字，低两位 != 0x3
 }
 
 void test_breakpoint(void) {
-    cprintf("\n Testing  breakpoint_32 \n");
+    cprintf("\n Testing  breakpoint \n");
     asm volatile ("ebreak");               // 标准断点      
-
-    cprintf("\n Testing  breakpoint_16 \n");
-    asm volatile (".short 0x9002");        // 压缩断点 c.ebreak
 }
 
 int kern_init(void) {
